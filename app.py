@@ -684,9 +684,7 @@ with tab3:
         })
         st.dataframe(df_contrib, use_container_width=True, hide_index=True)
 
-        st.session_state["sel_port"]    = sel_port
-        st.session_state["rets_port"]   = rets_port
-        st.session_state["manual_w"]    = weights_arr
+        
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -697,6 +695,8 @@ with tab4:
 
     # Récupérer sélection depuis tab3
     sel_opt = st.session_state.get("sel_port", fund_cols[:min(4, len(fund_cols))])
+    if isinstance(sel_opt, list) and len(sel_opt) == 0:
+    sel_opt = fund_cols[:min(4, len(fund_cols))]
     rets_opt = df_raw[sel_opt].pct_change().dropna()
     n_opt    = len(sel_opt)
 
