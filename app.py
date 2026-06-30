@@ -83,6 +83,18 @@ st.markdown("""
     .stButton > button:hover { background: #007850; }
 
     [data-testid="stDataFrame"] { border-radius: 8px; overflow: hidden; }
+
+    .badge {
+        display: inline-block;
+        background: #005537;
+        color: white;
+        border-radius: 4px;
+        padding: 3px 10px;
+        font-size: 0.75rem;
+        font-weight: 600;
+        margin: 2px 4px 8px 0;
+    }
+    .badge.gold { background: #C8952A; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -220,6 +232,47 @@ def build_wide_df_from_files(uploaded_files):
 
 def annualize_factor(freq):
     return TRADING_DAYS_ANNUAL if freq == "Journalières" else WEEKS_ANNUAL
+
+
+def detect_fund_frequency(date_index):
+    """
+    Détecte si une série de dates est journalière ou hebdomadaire,
+    via l'écart médian (en jours) entre observations consécutives.
+    """
+    dates = pd.Series(pd.to_datetime(date_index)).sort_values().drop_duplicates()
+    if len(dates) < 3:
+        return "Journalières"
+    diffs = dates.diff().dropna().dt.days
+    median_gap = diffs.median()
+    # Jour ouvré typique : 1-3j ; hebdo typique : 6-8j (week-end compris)
+    return "Hebdomadaires" if median_gap >= 5 else "Journalières"
+
+
+def resample_to_weekly(series):
+    """
+    Resample une série de VL en hebdomadaire en gardant la dernière valeur
+    observée de chaque semaine (convention 'last occurrence', cohérente
+    avec le pipeline de backtesting).
+    """
+    s = series.dropna().sort_index()
+    return s.resample("W-FRI").last().dropna()
+
+
+def build_weekly_aligned_df(df_raw, cols, fund_freq):
+    """
+    Construit un DataFrame de VL hebdomadaires aligné pour un ensemble de fonds,
+    quelle que soit leur fréquence native (journalière ou hebdomadaire).
+    Les fonds déjà hebdomadaires sont simplement réindexés sur grille W-FRI ;
+    les fonds journaliers sont resamplés (dernière VL de la semaine).
+    """
+    weekly_series = []
+    for c in cols:
+        s = df_raw[c]
+        s_weekly = resample_to_weekly(s)
+        weekly_series.append(s_weekly)
+    aligned = pd.concat(weekly_series, axis=1)
+    aligned.columns = cols
+    return aligned.dropna(how="all")
 
 
 def compute_ratios(returns, freq, rf):
@@ -364,7 +417,10 @@ with st.sidebar:
         help="Chaque fichier doit contenir une colonne 'value_date' et une colonne 'value'. Le nom du fichier sert de nom de fonds."
     )
     st.markdown("### ⚙️ Paramètres globaux")
-    freq     = st.radio("Fréquence des données", ["Journalières", "Hebdomadaires"], index=0)
+    freq = st.radio(
+        "Fréquence (données démo / fallback)", ["Journalières", "Hebdomadaires"], index=0,
+        help="Utilisée uniquement pour les données de démo. Avec vos fichiers, la fréquence est détectée automatiquement par fonds."
+    )
     rf_input = st.number_input("Taux sans risque annuel (%)", value=2.25, step=0.05, format="%.2f")
     RF       = rf_input / 100
 
@@ -438,6 +494,21 @@ for c in fund_cols:
 
 df_raw = df_raw.dropna(subset=fund_cols, how="all").set_index(date_col)
 
+# ── Détection de la fréquence native de chaque fonds ──────────────────────
+fund_freq = {}
+for c in fund_cols:
+    valid_dates = df_raw[c].dropna().index
+    fund_freq[c] = detect_fund_frequency(valid_dates)
+
+n_daily  = sum(1 for v in fund_freq.values() if v == "Journalières")
+n_weekly = sum(1 for v in fund_freq.values() if v == "Hebdomadaires")
+if n_daily and n_weekly:
+    st.warning(
+        f"⚠️ Fréquences mixtes détectées : {n_daily} fonds journaliers, {n_weekly} fonds hebdomadaires. "
+        f"Les ratios individuels (Tabs 1-2) utilisent la fréquence native de chaque fonds. "
+        f"Le portefeuille et l'optimisation (Tabs 3-4) alignent tout en hebdomadaire."
+    )
+
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -466,6 +537,12 @@ with tab1:
         norm_vl = st.checkbox("Base 100", value=True)
 
     if sel_funds_vl:
+        freq_badges = " &nbsp; ".join(
+            f"<span class='badge {'gold' if fund_freq[f]=='Hebdomadaires' else ''}'>{f} · {fund_freq[f]}</span>"
+            for f in sel_funds_vl
+        )
+        st.markdown(freq_badges, unsafe_allow_html=True)
+
         plot_df = df_raw[sel_funds_vl].copy().dropna()
         if norm_vl:
             plot_df = plot_df / plot_df.iloc[0] * 100
@@ -532,25 +609,33 @@ with tab2:
     )
 
     if sel_funds_r:
-        rets_all = df_raw[sel_funds_r].pct_change().dropna()
+        rets_all = df_raw[sel_funds_r].pct_change().dropna(how="all")
         results  = {}
         for f in sel_funds_r:
             ret_s = rets_all[f].dropna()
             if len(ret_s) > 5:
-                results[f] = compute_ratios(ret_s, freq, RF)
+                results[f] = compute_ratios(ret_s, fund_freq[f], RF)
 
         if results:
-            display_keys = [k for k in list(results[sel_funds_r[0]].keys()) if not k.startswith("_")]
-            table_data   = {k: [results[f].get(k, "N/A") for f in sel_funds_r] for k in display_keys}
-            df_table     = pd.DataFrame(table_data, index=sel_funds_r)
+            valid_funds = [f for f in sel_funds_r if f in results]
+
+            freq_badges = " &nbsp; ".join(
+                f"<span class='badge {'gold' if fund_freq[f]=='Hebdomadaires' else ''}'>{f} · {fund_freq[f]}</span>"
+                for f in valid_funds
+            )
+            st.markdown(freq_badges, unsafe_allow_html=True)
+
+            display_keys = [k for k in list(results[valid_funds[0]].keys()) if not k.startswith("_")]
+            table_data   = {k: [results[f].get(k, "N/A") for f in valid_funds] for k in display_keys}
+            df_table     = pd.DataFrame(table_data, index=valid_funds)
             st.dataframe(df_table.T, use_container_width=True, height=420)
 
             section("Comparaison Visuelle", "📉")
             c1, c2 = st.columns(2)
 
             with c1:
-                sharpe_vals  = [results[f]["_sharpe"] for f in sel_funds_r if not np.isnan(results[f]["_sharpe"])]
-                sharpe_names = [f for f in sel_funds_r if not np.isnan(results[f]["_sharpe"])]
+                sharpe_vals  = [results[f]["_sharpe"] for f in valid_funds if not np.isnan(results[f]["_sharpe"])]
+                sharpe_names = [f for f in valid_funds if not np.isnan(results[f]["_sharpe"])]
                 fig_s = go.Figure(go.Bar(
                     x=sharpe_names, y=sharpe_vals,
                     marker_color=["#005537" if v >= 0 else "#dc3545" for v in sharpe_vals],
@@ -561,13 +646,13 @@ with tab2:
                 st.plotly_chart(fig_s, use_container_width=True)
 
             with c2:
-                vol_vals  = [results[f]["_vol_ann"] * 100 for f in sel_funds_r]
-                perf_vals = [results[f]["_perf_ann"] * 100 for f in sel_funds_r]
+                vol_vals  = [results[f]["_vol_ann"] * 100 for f in valid_funds]
+                perf_vals = [results[f]["_perf_ann"] * 100 for f in valid_funds]
                 fig_rv = go.Figure()
                 fig_rv.add_trace(go.Scatter(
                     x=vol_vals, y=perf_vals,
                     mode="markers+text",
-                    text=sel_funds_r, textposition="top center",
+                    text=valid_funds, textposition="top center",
                     marker=dict(size=12, color="#005537", opacity=0.8),
                 ))
                 fig_rv.update_layout(
@@ -579,8 +664,8 @@ with tab2:
                 st.plotly_chart(fig_rv, use_container_width=True)
 
             section("Drawdown Historique", "📉")
-            sel_dd = st.selectbox("Fonds pour le drawdown", sel_funds_r)
-            cum_vl      = (1 + rets_all[sel_dd]).cumprod()
+            sel_dd = st.selectbox("Fonds pour le drawdown", valid_funds)
+            cum_vl      = (1 + rets_all[sel_dd].dropna()).cumprod()
             rolling_max = cum_vl.cummax()
             drawdown    = (cum_vl - rolling_max) / rolling_max * 100
 
@@ -633,74 +718,82 @@ with tab3:
         if abs(total_w - 100) > 0.1:
             st.error(f"⚠️ Somme des poids = {total_w:.1f}% ≠ 100%. Ajustez les poids.")
         else:
-            weights_arr = np.array(manual_weights) / 100
-            rets_port   = df_raw[sel_port].pct_change().dropna()
-            p_ret, p_vol, p_shr = portfolio_performance(weights_arr, rets_port, freq, RF)
+            PORT_FREQ = "Hebdomadaires"  # Alignement systématique en hebdo pour le portefeuille
+            vl_port_weekly = build_weekly_aligned_df(df_raw, sel_port, fund_freq)
 
-            port_rets = rets_port @ weights_arr
-            port_rets_clean = port_rets.dropna().values
-            var_95_p  = np.percentile(port_rets_clean, 5)
-            var_99_p  = np.percentile(port_rets_clean, 1)
-            cvar_95_p = port_rets_clean[port_rets_clean <= var_95_p].mean()
-            cvar_99_p = port_rets_clean[port_rets_clean <= var_99_p].mean()
+            if vl_port_weekly.dropna().shape[0] < 10:
+                st.error("⚠️ Pas assez d'observations communes après alignement hebdomadaire entre les fonds sélectionnés.")
+            else:
+                weights_arr = np.array(manual_weights) / 100
+                rets_port   = vl_port_weekly.pct_change().dropna()
+                p_ret, p_vol, p_shr = portfolio_performance(weights_arr, rets_port, PORT_FREQ, RF)
 
-            section("Métriques du Portefeuille Manuel", "📌")
-            k1, k2, k3, k4, k5, k6 = st.columns(6)
-            with k1: kpi_card("Perf. Ann.",  f"{p_ret*100:.2f}%",   "positive" if p_ret > 0 else "negative")
-            with k2: kpi_card("Volatilité",  f"{p_vol*100:.2f}%",   "neutral")
-            with k3: kpi_card("Sharpe",      f"{p_shr:.4f}",        "positive" if p_shr > 0 else "negative")
-            with k4: kpi_card("VaR 95%",     f"{var_95_p*100:.4f}%","negative")
-            with k5: kpi_card("VaR 99%",     f"{var_99_p*100:.4f}%","negative")
-            with k6: kpi_card("CVaR 99%",    f"{cvar_99_p*100:.4f}%","negative")
+                port_rets = rets_port @ weights_arr
+                port_rets_clean = port_rets.dropna().values
+                var_95_p  = np.percentile(port_rets_clean, 5)
+                var_99_p  = np.percentile(port_rets_clean, 1)
+                cvar_95_p = port_rets_clean[port_rets_clean <= var_95_p].mean()
+                cvar_99_p = port_rets_clean[port_rets_clean <= var_99_p].mean()
 
-            c1, c2 = st.columns([1, 2])
-            with c1:
-                fig_pie = go.Figure(go.Pie(
-                    labels=sel_port, values=manual_weights,
-                    hole=0.4, marker_colors=px.colors.qualitative.Set2,
-                    textinfo="label+percent"
-                ))
-                fig_pie.update_layout(title="Allocation", height=350,
-                                      margin=dict(t=40, b=0, l=0, r=0))
-                st.plotly_chart(fig_pie, use_container_width=True)
+                st.caption("📅 Portefeuille calculé sur VL hebdomadaires (vendredi) — alignement automatique des fonds journaliers et hebdomadaires.")
 
-            with c2:
-                cum_port = (1 + port_rets).cumprod()
-                fig_cp   = go.Figure()
-                fig_cp.add_trace(go.Scatter(
-                    x=cum_port.index, y=(cum_port - 1) * 100,
-                    mode="lines", name="Portefeuille",
-                    line=dict(color="#005537", width=2.5),
-                    fill="tozeroy", fillcolor="rgba(0,85,55,0.1)"
-                ))
-                for f in sel_port:
-                    cum_f = (1 + rets_port[f]).cumprod()
-                    fig_cp.add_trace(go.Scatter(
-                        x=cum_f.index, y=(cum_f - 1) * 100,
-                        mode="lines", name=f, opacity=0.5,
-                        line=dict(width=1, dash="dot")
+                section("Métriques du Portefeuille Manuel", "📌")
+                k1, k2, k3, k4, k5, k6 = st.columns(6)
+                with k1: kpi_card("Perf. Ann.",  f"{p_ret*100:.2f}%",   "positive" if p_ret > 0 else "negative")
+                with k2: kpi_card("Volatilité",  f"{p_vol*100:.2f}%",   "neutral")
+                with k3: kpi_card("Sharpe",      f"{p_shr:.4f}",        "positive" if p_shr > 0 else "negative")
+                with k4: kpi_card("VaR 95%",     f"{var_95_p*100:.4f}%","negative")
+                with k5: kpi_card("VaR 99%",     f"{var_99_p*100:.4f}%","negative")
+                with k6: kpi_card("CVaR 99%",    f"{cvar_99_p*100:.4f}%","negative")
+
+                c1, c2 = st.columns([1, 2])
+                with c1:
+                    fig_pie = go.Figure(go.Pie(
+                        labels=sel_port, values=manual_weights,
+                        hole=0.4, marker_colors=px.colors.qualitative.Set2,
+                        textinfo="label+percent"
                     ))
-                fig_cp.update_layout(
-                    title="Performance Cumulée (%)",
-                    xaxis_title="Date", yaxis_title="Perf. Cumulée (%)",
-                    template="plotly_white", height=350,
-                    legend=dict(orientation="h", y=-0.2)
-                )
-                st.plotly_chart(fig_cp, use_container_width=True)
+                    fig_pie.update_layout(title="Allocation", height=350,
+                                          margin=dict(t=40, b=0, l=0, r=0))
+                    st.plotly_chart(fig_pie, use_container_width=True)
 
-            section("Contribution au Risque", "⚖️")
-            n_ann    = annualize_factor(freq)
-            cov_m    = rets_port.cov() * n_ann
-            port_var = weights_arr @ cov_m.values @ weights_arr
-            marginal = cov_m.values @ weights_arr
-            contrib  = weights_arr * marginal / port_var * 100
+                with c2:
+                    cum_port = (1 + port_rets).cumprod()
+                    fig_cp   = go.Figure()
+                    fig_cp.add_trace(go.Scatter(
+                        x=cum_port.index, y=(cum_port - 1) * 100,
+                        mode="lines", name="Portefeuille",
+                        line=dict(color="#005537", width=2.5),
+                        fill="tozeroy", fillcolor="rgba(0,85,55,0.1)"
+                    ))
+                    for f in sel_port:
+                        cum_f = (1 + rets_port[f]).cumprod()
+                        fig_cp.add_trace(go.Scatter(
+                            x=cum_f.index, y=(cum_f - 1) * 100,
+                            mode="lines", name=f, opacity=0.5,
+                            line=dict(width=1, dash="dot")
+                        ))
+                    fig_cp.update_layout(
+                        title="Performance Cumulée (%) — base hebdomadaire",
+                        xaxis_title="Date", yaxis_title="Perf. Cumulée (%)",
+                        template="plotly_white", height=350,
+                        legend=dict(orientation="h", y=-0.2)
+                    )
+                    st.plotly_chart(fig_cp, use_container_width=True)
 
-            df_contrib = pd.DataFrame({
-                "Fonds":                       sel_port,
-                "Poids (%)":                   [f"{w:.1f}" for w in manual_weights],
-                "Contribution au risque (%)":  [f"{c:.2f}" for c in contrib]
-            })
-            st.dataframe(df_contrib, use_container_width=True, hide_index=True)
+                section("Contribution au Risque", "⚖️")
+                n_ann    = annualize_factor(PORT_FREQ)
+                cov_m    = rets_port.cov() * n_ann
+                port_var = weights_arr @ cov_m.values @ weights_arr
+                marginal = cov_m.values @ weights_arr
+                contrib  = weights_arr * marginal / port_var * 100
+
+                df_contrib = pd.DataFrame({
+                    "Fonds":                       sel_port,
+                    "Poids (%)":                   [f"{w:.1f}" for w in manual_weights],
+                    "Contribution au risque (%)":  [f"{c:.2f}" for c in contrib]
+                })
+                st.dataframe(df_contrib, use_container_width=True, hide_index=True)
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -714,21 +807,28 @@ with tab4:
     if not sel_opt or len(sel_opt) < 2:
         sel_opt = fund_cols[:min(4, len(fund_cols))]
 
-    rets_opt = df_raw[sel_opt].pct_change().dropna()
+    OPT_FREQ = "Hebdomadaires"  # Alignement systématique en hebdo pour l'optimisation
+    vl_opt_weekly = build_weekly_aligned_df(df_raw, sel_opt, fund_freq)
+    rets_opt = vl_opt_weekly.pct_change().dropna()
     n_opt    = len(sel_opt)
 
+    if rets_opt.shape[0] < 10:
+        st.warning("⚠️ Pas assez d'observations communes après alignement hebdomadaire entre les fonds sélectionnés. Choisissez d'autres fonds dans l'onglet précédent.")
+        st.stop()
+
     st.info(f"💼 Portefeuille actif : **{', '.join(sel_opt)}** ({n_opt} fonds) | Contraintes : poids ∈ [{w_min*100:.0f}%, {w_max*100:.0f}%]")
+    st.caption("📅 Optimisation calculée sur VL hebdomadaires (vendredi) — alignement automatique des fonds journaliers et hebdomadaires.")
 
     with st.spinner("⚙️ Calcul de la frontière efficiente..."):
-        f_rets, f_vols, f_sharpe, f_weights = efficient_frontier(rets_opt, freq, RF, n_points=80)
-        w_ms = optimize_max_sharpe(rets_opt, freq, RF, w_min, w_max)
-        w_mv = optimize_min_variance(rets_opt, freq, RF, w_min, w_max)
-        w_mc = optimize_min_cvar(rets_opt, freq, RF, w_min=w_min, w_max=w_max)
-        p_ms = portfolio_performance(w_ms, rets_opt, freq, RF)
-        p_mv = portfolio_performance(w_mv, rets_opt, freq, RF)
-        p_mc = portfolio_performance(w_mc, rets_opt, freq, RF)
+        f_rets, f_vols, f_sharpe, f_weights = efficient_frontier(rets_opt, OPT_FREQ, RF, n_points=80)
+        w_ms = optimize_max_sharpe(rets_opt, OPT_FREQ, RF, w_min, w_max)
+        w_mv = optimize_min_variance(rets_opt, OPT_FREQ, RF, w_min, w_max)
+        w_mc = optimize_min_cvar(rets_opt, OPT_FREQ, RF, w_min=w_min, w_max=w_max)
+        p_ms = portfolio_performance(w_ms, rets_opt, OPT_FREQ, RF)
+        p_mv = portfolio_performance(w_mv, rets_opt, OPT_FREQ, RF)
+        p_mc = portfolio_performance(w_mc, rets_opt, OPT_FREQ, RF)
 
-    n_ann    = annualize_factor(freq)
+    n_ann    = annualize_factor(OPT_FREQ)
     ind_perf = (1 + rets_opt.mean()) ** n_ann - 1
     ind_vol  = rets_opt.std() * np.sqrt(n_ann)
 
@@ -736,7 +836,7 @@ with tab4:
     mc_rets, mc_vols, mc_sharpes = [], [], []
     for _ in range(n_sim):
         w = np.random.dirichlet(np.ones(n_opt))
-        r, v, s = portfolio_performance(w, rets_opt, freq, RF)
+        r, v, s = portfolio_performance(w, rets_opt, OPT_FREQ, RF)
         mc_rets.append(r * 100)
         mc_vols.append(v * 100)
         mc_sharpes.append(s)
