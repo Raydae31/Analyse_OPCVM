@@ -637,6 +637,7 @@ with tab3:
             rets_port   = df_raw[sel_port].pct_change().dropna()
             p_ret, p_vol, p_shr = portfolio_performance(weights_arr, rets_port, freq, RF)
 
+            port_rets = rets_port @ weights_arr
             port_rets_clean = port_rets.dropna().values
             var_95_p  = np.percentile(port_rets_clean, 5)
             var_99_p  = np.percentile(port_rets_clean, 1)
