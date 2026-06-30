@@ -96,7 +96,8 @@ WEEKS_ANNUAL = 52
 # FONCTIONS UTILITAIRES
 # ─────────────────────────────────────────────────────────────────────────────
 
-def parse_uploaded_file(uploaded_file):
+def parse_raw_file(uploaded_file):
+    """Lit un fichier brut (CSV ou Excel) et retourne un DataFrame tel quel."""
     name = uploaded_file.name.lower()
     try:
         if name.endswith(".csv"):
@@ -112,7 +113,7 @@ def parse_uploaded_file(uploaded_file):
         else:
             return pd.read_excel(uploaded_file, index_col=None)
     except Exception as e:
-        st.error(f"Erreur lecture fichier : {e}")
+        st.error(f"Erreur lecture fichier {uploaded_file.name} : {e}")
         return None
 
 
@@ -125,6 +126,96 @@ def detect_date_col(df):
         except:
             continue
     return None
+
+
+def detect_value_col(df, exclude_col):
+    """Détecte la colonne de valeur (VL) parmi les colonnes restantes."""
+    candidates = [c for c in df.columns if c != exclude_col]
+    for c in candidates:
+        if str(c).strip().lower() in ("value", "valeur", "vl", "nav", "val"):
+            return c
+    for c in candidates:
+        if pd.to_numeric(df[c], errors="coerce").notna().mean() > 0.7:
+            return c
+    return candidates[0] if candidates else None
+
+
+def fund_name_from_filename(filename):
+    """Dérive un nom de fonds propre à partir du nom de fichier."""
+    base = filename.rsplit(".", 1)[0]
+    base = base.replace("_", " ").replace("-", " ").strip()
+    return base if base else filename
+
+
+def load_single_fund_file(uploaded_file):
+    """
+    Lit un fichier 'value_date' / 'value' (1 fichier = 1 fonds) et retourne
+    une Series indexée par date, nommée d'après le fichier.
+    Retourne None si le fichier est illisible ou mal formé.
+    """
+    df = parse_raw_file(uploaded_file)
+    if df is None or df.empty:
+        return None
+
+    cols_lower = {str(c).strip().lower(): c for c in df.columns}
+
+    date_col = None
+    for key in ("value_date", "date", "valuedate", "value date"):
+        if key in cols_lower:
+            date_col = cols_lower[key]
+            break
+    if date_col is None:
+        date_col = detect_date_col(df)
+    if date_col is None:
+        st.warning(f"⚠️ {uploaded_file.name} : colonne date introuvable, fichier ignoré.")
+        return None
+
+    value_col = None
+    for key in ("value", "valeur", "vl", "nav"):
+        if key in cols_lower:
+            value_col = cols_lower[key]
+            break
+    if value_col is None:
+        value_col = detect_value_col(df, date_col)
+    if value_col is None:
+        st.warning(f"⚠️ {uploaded_file.name} : colonne valeur introuvable, fichier ignoré.")
+        return None
+
+    out = df[[date_col, value_col]].copy()
+    out.columns = ["date", "value"]
+    out["date"]  = pd.to_datetime(out["date"], dayfirst=True, errors="coerce")
+    out["value"] = pd.to_numeric(out["value"], errors="coerce")
+    out = out.dropna(subset=["date", "value"]).sort_values("date")
+    out = out.drop_duplicates(subset="date", keep="last")
+
+    if out.empty:
+        st.warning(f"⚠️ {uploaded_file.name} : aucune donnée valide après nettoyage, fichier ignoré.")
+        return None
+
+    fund_name = fund_name_from_filename(uploaded_file.name)
+    series = out.set_index("date")["value"]
+    series.name = fund_name
+    return series
+
+
+def build_wide_df_from_files(uploaded_files):
+    """
+    Combine plusieurs fichiers (1 fichier = 1 fonds, colonnes value_date/value)
+    en un seul DataFrame large : index = Date, 1 colonne par fonds.
+    """
+    series_list = []
+    for f in uploaded_files:
+        s = load_single_fund_file(f)
+        if s is not None:
+            series_list.append(s)
+
+    if not series_list:
+        return None
+
+    wide = pd.concat(series_list, axis=1)
+    wide = wide.sort_index()
+    wide.index.name = "Date"
+    return wide.reset_index()
 
 
 def annualize_factor(freq):
@@ -145,8 +236,8 @@ def compute_ratios(returns, freq, rf):
     drawdown  = (cum_vl - cum_vl.cummax()) / cum_vl.cummax()
     max_dd    = drawdown.min()
     calmar    = perf_ann / abs(max_dd) if max_dd != 0 else np.nan
-    var_95    = np.percentile(returns, 5)
-    var_99    = np.percentile(returns, 1)
+    var_95    = np.percentile(returns.dropna().values, 5)
+    var_99    = np.percentile(returns.dropna().values, 1)
     cvar_95   = returns[returns <= var_95].mean()
     cvar_99   = returns[returns <= var_99].mean()
 
@@ -235,9 +326,12 @@ def optimize_min_cvar(returns_df, freq, rf, alpha=0.05, w_min=0.0, w_max=1.0):
     constraints = [{"type": "eq", "fun": lambda w: np.sum(w) - 1}]
 
     def neg_cvar(w):
-        port_r = returns_df @ w
-        var    = np.percentile(port_r, alpha * 100)
-        return port_r[port_r <= var].mean()
+        port_r = (returns_df @ w).dropna().values
+        if len(port_r) == 0:
+            return 0.0
+        var = np.percentile(port_r, alpha * 100)
+        tail = port_r[port_r <= var]
+        return float(tail.mean()) if len(tail) > 0 else float(var)
 
     res = minimize(neg_cvar, np.ones(n) / n, method="SLSQP",
                    bounds=bounds, constraints=constraints, options={"maxiter": 500})
@@ -263,10 +357,11 @@ with st.sidebar:
     st.markdown("## 📊 OPCVM Analytics")
     st.markdown("---")
     st.markdown("### 📁 Import des données")
-    uploaded = st.file_uploader(
-        "Fichier VL (CSV ou Excel)",
+    uploaded_files = st.file_uploader(
+        "Fichiers VL — 1 fichier par fonds",
         type=["csv", "xlsx", "xls"],
-        help="Format : 1 colonne Date + N colonnes VL (une par fonds)"
+        accept_multiple_files=True,
+        help="Chaque fichier doit contenir une colonne 'value_date' et une colonne 'value'. Le nom du fichier sert de nom de fonds."
     )
     st.markdown("### ⚙️ Paramètres globaux")
     freq     = st.radio("Fréquence des données", ["Journalières", "Hebdomadaires"], index=0)
@@ -321,21 +416,19 @@ df_raw    = None
 date_col  = None
 fund_cols = []
 
-if uploaded is None:
+if not uploaded_files:
     st.info("💡 Aucun fichier importé — données de démo (6 fonds fictifs)")
     df_raw    = load_demo_data()
     date_col  = "Date"
     fund_cols = [c for c in df_raw.columns if c != "Date"]
 else:
-    df_raw = parse_uploaded_file(uploaded)
+    df_raw = build_wide_df_from_files(uploaded_files)
     if df_raw is not None:
-        date_col = detect_date_col(df_raw)
-        if date_col:
-            df_raw[date_col] = pd.to_datetime(df_raw[date_col], dayfirst=True, errors="coerce")
-            df_raw = df_raw.dropna(subset=[date_col]).sort_values(date_col)
-            fund_cols = [c for c in df_raw.columns if c != date_col]
-        else:
-            st.error("❌ Impossible de détecter la colonne Date.")
+        date_col  = "Date"
+        fund_cols = [c for c in df_raw.columns if c != "Date"]
+        st.success(f"✅ {len(fund_cols)} fonds chargés : {', '.join(fund_cols)}")
+    else:
+        st.error("❌ Aucun fichier n'a pu être lu correctement. Vérifiez le format (colonnes value_date / value).")
 
 if df_raw is None or not fund_cols:
     st.stop()
@@ -544,11 +637,11 @@ with tab3:
             rets_port   = df_raw[sel_port].pct_change().dropna()
             p_ret, p_vol, p_shr = portfolio_performance(weights_arr, rets_port, freq, RF)
 
-            port_rets = rets_port @ weights_arr
-            var_95_p  = np.percentile(port_rets, 5)
-            var_99_p  = np.percentile(port_rets, 1)
-            cvar_95_p = port_rets[port_rets <= var_95_p].mean()
-            cvar_99_p = port_rets[port_rets <= var_99_p].mean()
+            port_rets_clean = port_rets.dropna().values
+            var_95_p  = np.percentile(port_rets_clean, 5)
+            var_99_p  = np.percentile(port_rets_clean, 1)
+            cvar_95_p = port_rets_clean[port_rets_clean <= var_95_p].mean()
+            cvar_99_p = port_rets_clean[port_rets_clean <= var_99_p].mean()
 
             section("Métriques du Portefeuille Manuel", "📌")
             k1, k2, k3, k4, k5, k6 = st.columns(6)
