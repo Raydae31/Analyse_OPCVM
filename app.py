@@ -512,11 +512,12 @@ if n_daily and n_weekly:
 # ─────────────────────────────────────────────────────────────────────────────
 # TABS
 # ─────────────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4 = st.tabs([
+tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "📈 Évolution des VL",
     "📊 Ratios de Performance",
     "🏗️ Construction du Portefeuille",
-    "🎯 Optimisation & Frontière Efficiente"
+    "🎯 Optimisation & Frontière Efficiente",
+    "🧮 Allocation par Scoring"
 ])
 
 
@@ -1009,3 +1010,292 @@ with tab4:
         mime="text/csv"
     )
     st.dataframe(df_export, use_container_width=True, hide_index=True)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# TAB 5 — ALLOCATION PAR SCORING DE RATIOS
+# ═══════════════════════════════════════════════════════════════════════════
+with tab5:
+    section("Allocation par scoring de ratios de performance", "🧮")
+
+    st.markdown(
+        "Outil de composition de portefeuille basé uniquement sur les ratios de performance "
+        "de chaque fonds — sans optimisation mathématique. Chaque fonds reçoit un score "
+        "composite pondéré, et le poids alloué est proportionnel à ce score."
+    )
+
+    # ── Sélection des fonds & calcul des ratios ─────────────────────────────
+    sel_scoring = st.multiselect(
+        "Fonds à inclure dans le scoring",
+        fund_cols,
+        default=fund_cols,
+        key="sel_scoring"
+    )
+
+    if len(sel_scoring) < 2:
+        st.warning("⚠️ Sélectionnez au moins 2 fonds.")
+        st.stop()
+
+    rets_sc = df_raw[sel_scoring].pct_change().dropna(how="all")
+    ratios_sc = {}
+    for f in sel_scoring:
+        r = rets_sc[f].dropna()
+        if len(r) > 5:
+            ratios_sc[f] = compute_ratios(r, fund_freq[f], RF)
+
+    valid_sc = [f for f in sel_scoring if f in ratios_sc]
+    if len(valid_sc) < 2:
+        st.warning("⚠️ Données insuffisantes pour calculer les ratios.")
+        st.stop()
+
+    # ── Profil investisseur ─────────────────────────────────────────────────
+    section("Profil investisseur", "👤")
+    profiles = {
+        "Équilibré":   dict(sharpe=35, sortino=25, calmar=20, var=20),
+        "Croissance":  dict(sharpe=45, sortino=30, calmar=10, var=15),
+        "Défensif":    dict(sharpe=20, sortino=20, calmar=25, var=35),
+        "Personnalisé":None,
+    }
+    profile_choice = st.radio(
+        "Profil", list(profiles.keys()), horizontal=True, key="profile_sc"
+    )
+
+    if profiles[profile_choice] is not None:
+        default_w = profiles[profile_choice]
+    else:
+        default_w = dict(sharpe=25, sortino=25, calmar=25, var=25)
+
+    st.markdown("##### Poids des critères (total doit faire 100%)")
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        w_sharpe_sc = st.slider("Sharpe (%)", 0, 100, default_w["sharpe"], 5, key="ws_sc")
+    with c2:
+        w_sortino_sc = st.slider("Sortino (%)", 0, 100, default_w["sortino"], 5, key="wso_sc")
+    with c3:
+        w_calmar_sc = st.slider("Calmar (%)", 0, 100, default_w["calmar"], 5, key="wc_sc")
+    with c4:
+        w_var_sc = st.slider("VaR 99% (%)", 0, 100, default_w["var"], 5, key="wv_sc")
+
+    total_lambda = w_sharpe_sc + w_sortino_sc + w_calmar_sc + w_var_sc
+    if total_lambda != 100:
+        st.error(f"⚠️ La somme des poids = {total_lambda}% ≠ 100%. Ajustez les curseurs.")
+        st.stop()
+
+    # ── Calcul du scoring ───────────────────────────────────────────────────
+    def minmax_norm(values, higher_is_better=True):
+        arr = np.array(values, dtype=float)
+        mn, mx = np.nanmin(arr), np.nanmax(arr)
+        if mx == mn:
+            return np.full(len(arr), 0.5)
+        norm = (arr - mn) / (mx - mn)
+        return norm if higher_is_better else 1 - norm
+
+    sharpe_raw  = [ratios_sc[f]["_sharpe"]  for f in valid_sc]
+    sortino_raw = []
+    calmar_raw  = []
+    var_raw     = []
+
+    for f in valid_sc:
+        r = rets_sc[f].dropna()
+        n = annualize_factor(fund_freq[f])
+        rf_p = RF / n
+        perf_ann = ratios_sc[f]["_perf_ann"]
+
+        # Sortino
+        down = r[r < rf_p].std() * np.sqrt(n)
+        sortino_raw.append((perf_ann - RF) / down if down > 0 else np.nan)
+
+        # Calmar
+        cum = (1 + r).cumprod()
+        dd = (cum - cum.cummax()) / cum.cummax()
+        mdd = dd.min()
+        calmar_raw.append(perf_ann / abs(mdd) if mdd != 0 else np.nan)
+
+        # VaR 99%
+        var99 = np.percentile(r.dropna().values, 1)
+        var_raw.append(var99)
+
+    sharpe_norm  = minmax_norm(sharpe_raw,  higher_is_better=True)
+    sortino_norm = minmax_norm(sortino_raw, higher_is_better=True)
+    calmar_norm  = minmax_norm(calmar_raw,  higher_is_better=True)
+    var_norm     = minmax_norm(var_raw,     higher_is_better=False)  # VaR : plus basse = mieux
+
+    lS  = w_sharpe_sc  / 100
+    lSo = w_sortino_sc / 100
+    lC  = w_calmar_sc  / 100
+    lV  = w_var_sc     / 100
+
+    scores = [
+        lS * sharpe_norm[i] + lSo * sortino_norm[i] +
+        lC * calmar_norm[i] + lV  * var_norm[i]
+        for i in range(len(valid_sc))
+    ]
+
+    pos_scores = [max(s, 0) for s in scores]
+    total_score = sum(pos_scores)
+    weights_sc = [s / total_score if total_score > 0 else 0 for s in pos_scores]
+
+    # ── Tableau de scoring ──────────────────────────────────────────────────
+    section("Tableau de scoring", "📋")
+
+    ranked = sorted(
+        zip(valid_sc, sharpe_raw, sortino_raw, calmar_raw, var_raw, scores, weights_sc),
+        key=lambda x: x[5], reverse=True
+    )
+
+    df_scoring = pd.DataFrame({
+        "Rang":         [f"#{i+1}" for i in range(len(ranked))],
+        "Fonds":        [r[0] for r in ranked],
+        "Sharpe":       [f"{r[1]:.4f}" if not np.isnan(r[1]) else "N/A" for r in ranked],
+        "Sortino":      [f"{r[2]:.4f}" if not np.isnan(r[2]) else "N/A" for r in ranked],
+        "Calmar":       [f"{r[3]:.4f}" if not np.isnan(r[3]) else "N/A" for r in ranked],
+        "VaR 99%":      [f"{r[4]*100:.4f}%" for r in ranked],
+        "Score (0→1)":  [f"{r[5]:.4f}" for r in ranked],
+        "Poids alloué": [f"{r[6]*100:.2f}%" for r in ranked],
+    })
+    st.dataframe(df_scoring, use_container_width=True, hide_index=True)
+
+    # ── KPI portefeuille résultant ──────────────────────────────────────────
+    section("Performance du portefeuille scoré", "📌")
+
+    w_arr_sc  = np.array([r[6] for r in ranked])
+    funds_ord = [r[0] for r in ranked]
+
+    vl_sc_weekly  = build_weekly_aligned_df(df_raw, funds_ord, fund_freq)
+    rets_sc_port  = vl_sc_weekly.pct_change().dropna()
+    port_sc_rets  = rets_sc_port @ w_arr_sc
+    p_sc_ret, p_sc_vol, p_sc_shr = portfolio_performance(w_arr_sc, rets_sc_port, "Hebdomadaires", RF)
+
+    clean_sc = port_sc_rets.dropna().values
+    var95_sc  = np.percentile(clean_sc, 5)
+    var99_sc  = np.percentile(clean_sc, 1)
+    cvar99_sc = clean_sc[clean_sc <= var99_sc].mean()
+
+    k1, k2, k3, k4, k5_col = st.columns(5)
+    with k1: kpi_card("Perf. Ann.",  f"{p_sc_ret*100:.2f}%",  "positive" if p_sc_ret > 0 else "negative")
+    with k2: kpi_card("Volatilité",  f"{p_sc_vol*100:.2f}%",  "neutral")
+    with k3: kpi_card("Sharpe",      f"{p_sc_shr:.4f}",       "positive" if p_sc_shr > 0 else "negative")
+    with k4: kpi_card("VaR 99%",     f"{var99_sc*100:.4f}%",  "negative")
+    with k5_col: kpi_card("CVaR 99%",f"{cvar99_sc*100:.4f}%", "negative")
+
+    # ── Recommandation par fonds ────────────────────────────────────────────
+    section("Recommandation", "💡")
+
+    rec_include = [(r[0], r[6]) for r in ranked if r[6] >= 0.15]
+    rec_watch   = [(r[0], r[6]) for r in ranked if 0 < r[6] < 0.15]
+    rec_exclude = [r[0] for r in ranked if r[6] == 0]
+
+    if rec_include:
+        fonds_str = " · ".join([f"{f} ({w*100:.1f}%)" for f, w in rec_include])
+        st.success(f"**Position principale** — {fonds_str}")
+    if rec_watch:
+        fonds_str = " · ".join([f"{f} ({w*100:.1f}%)" for f, w in rec_watch])
+        st.warning(f"**Position satellite** — {fonds_str}")
+    if rec_exclude:
+        st.error(f"**Score nul — à exclure** — {' · '.join(rec_exclude)}")
+
+    # ── Visualisations ──────────────────────────────────────────────────────
+    section("Visualisations", "📊")
+    c1, c2 = st.columns(2)
+
+    with c1:
+        labels_pie = [r[0] for r in ranked if r[6] > 0]
+        vals_pie   = [r[6]*100 for r in ranked if r[6] > 0]
+        fig_pie_sc = go.Figure(go.Pie(
+            labels=labels_pie, values=vals_pie,
+            hole=0.4, marker_colors=px.colors.qualitative.Set2,
+            textinfo="label+percent"
+        ))
+        fig_pie_sc.update_layout(
+            title="Allocation par scoring", height=340,
+            margin=dict(t=40, b=0, l=0, r=0)
+        )
+        st.plotly_chart(fig_pie_sc, use_container_width=True)
+
+    with c2:
+        fig_bar_sc = go.Figure(go.Bar(
+            x=[r[5] for r in ranked],
+            y=[r[0] for r in ranked],
+            orientation="h",
+            marker_color=["#005537" if r[6] >= 0.15 else "#C8952A" if r[6] > 0 else "#dc3545" for r in ranked],
+            text=[f"{r[5]:.3f}" for r in ranked],
+            textposition="outside"
+        ))
+        fig_bar_sc.update_layout(
+            title="Score composite par fonds",
+            xaxis_title="Score (0 → 1)",
+            template="plotly_white", height=340,
+            yaxis=dict(autorange="reversed"),
+            showlegend=False
+        )
+        st.plotly_chart(fig_bar_sc, use_container_width=True)
+
+    # Performance cumulée portefeuille scoré vs fonds individuels
+    cum_sc = (1 + port_sc_rets).cumprod()
+    fig_sc_perf = go.Figure()
+    fig_sc_perf.add_trace(go.Scatter(
+        x=cum_sc.index, y=(cum_sc - 1) * 100,
+        mode="lines", name="Portefeuille scoré",
+        line=dict(color="#005537", width=2.5),
+        fill="tozeroy", fillcolor="rgba(0,85,55,0.08)"
+    ))
+    colors_sc = px.colors.qualitative.Set2
+    for i, f in enumerate(funds_ord):
+        cum_f = (1 + rets_sc_port[f]).cumprod()
+        fig_sc_perf.add_trace(go.Scatter(
+            x=cum_f.index, y=(cum_f - 1) * 100,
+            mode="lines", name=f, opacity=0.5,
+            line=dict(width=1, dash="dot", color=colors_sc[i % len(colors_sc)])
+        ))
+    fig_sc_perf.update_layout(
+        title="Performance cumulée — Portefeuille scoré vs fonds individuels (%)",
+        xaxis_title="Date", yaxis_title="Perf. cumulée (%)",
+        template="plotly_white", height=400,
+        legend=dict(orientation="h", y=-0.2),
+        hovermode="x unified"
+    )
+    st.plotly_chart(fig_sc_perf, use_container_width=True)
+
+    # ── Comparaison avec les 3 stratégies d'optimisation ───────────────────
+    section("Comparaison avec les stratégies d'optimisation", "⚖️")
+    st.caption("Les métriques ci-dessous comparent le portefeuille scoré aux 3 portefeuilles optimaux calculés dans l'onglet Optimisation — sur les mêmes fonds si disponibles.")
+
+    try:
+        common_funds = [f for f in funds_ord if f in sel_opt]
+        if len(common_funds) >= 2:
+            vl_cmp   = build_weekly_aligned_df(df_raw, common_funds, fund_freq)
+            rets_cmp = vl_cmp.pct_change().dropna()
+
+            w_ms_cmp = optimize_max_sharpe(rets_cmp, "Hebdomadaires", RF, w_min, w_max)
+            w_mv_cmp = optimize_min_variance(rets_cmp, "Hebdomadaires", RF, w_min, w_max)
+            p_ms_cmp = portfolio_performance(w_ms_cmp, rets_cmp, "Hebdomadaires", RF)
+            p_mv_cmp = portfolio_performance(w_mv_cmp, rets_cmp, "Hebdomadaires", RF)
+
+            w_sc_cmp = np.array([
+                weights_sc[valid_sc.index(f)] if f in valid_sc else 0
+                for f in common_funds
+            ])
+            w_sc_cmp = w_sc_cmp / w_sc_cmp.sum() if w_sc_cmp.sum() > 0 else w_sc_cmp
+            p_sc_cmp = portfolio_performance(w_sc_cmp, rets_cmp, "Hebdomadaires", RF)
+
+            df_cmp = pd.DataFrame({
+                "Stratégie":      ["Scoring (ratios)", "Max Sharpe", "Min Variance"],
+                "Perf. Ann. (%)": [f"{p_sc_cmp[0]*100:.2f}", f"{p_ms_cmp[0]*100:.2f}", f"{p_mv_cmp[0]*100:.2f}"],
+                "Vol. Ann. (%)":  [f"{p_sc_cmp[1]*100:.2f}", f"{p_ms_cmp[1]*100:.2f}", f"{p_mv_cmp[1]*100:.2f}"],
+                "Sharpe":         [f"{p_sc_cmp[2]:.4f}",     f"{p_ms_cmp[2]:.4f}",     f"{p_mv_cmp[2]:.4f}"],
+            })
+            st.dataframe(df_cmp, use_container_width=True, hide_index=True)
+        else:
+            st.info("Sélectionnez les mêmes fonds dans l'onglet Optimisation pour afficher la comparaison.")
+    except Exception:
+        st.info("Lancez d'abord l'onglet Optimisation pour afficher la comparaison.")
+
+    # ── Export ──────────────────────────────────────────────────────────────
+    section("Export", "💾")
+    csv_sc = df_scoring.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+    st.download_button(
+        label="⬇️ Télécharger le scoring (CSV)",
+        data=csv_sc,
+        file_name="opcvm_scoring_allocation.csv",
+        mime="text/csv"
+    )
